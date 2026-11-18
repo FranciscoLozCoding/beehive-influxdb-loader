@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest import TestCase, main
 from unittest.mock import Mock, patch
 
-from archive import cold_record, day_for_ns, WriteLeaseLost
+from archive import cold_record, day_for_ns, WriteLeaseLost, AdmissionPaused
 from main import MessageHandler
 
 
@@ -51,6 +51,21 @@ class TestArchival(TestCase):
         self.assertEqual(len(writer.write.call_args.args[2]), 1)
         self.assertEqual(coord.enqueue.call_args.args[1][0]["time"], 1740787200000000194)
         b.basic_ack.assert_called_once_with(2)
+
+    def test_backup_pause_releases_unused_permit_without_ack_or_hot_write(self):
+        handler, writer, coord = self.make_handler()
+        hot = self.delivery(handler, 1746057600000000194, 1)
+        late = self.delivery(handler, 1740787200000000194, 2)
+        coord.enqueue.side_effect = AdmissionPaused(30)
+        lease = coord.acquire_lease.return_value
+        with patch("main.message.load", side_effect=self.parse):
+            with self.assertRaises(AdmissionPaused):
+                handler.flush()
+        lease.abort_before_hot_write.assert_called_once_with()
+        writer.write.assert_not_called()
+        hot.basic_ack.assert_not_called()
+        late.basic_ack.assert_not_called()
+        self.assertEqual(len(handler.batch), 2)
 
     def test_influx_error_never_acknowledges_or_releases(self):
         handler, writer, coord = self.make_handler()

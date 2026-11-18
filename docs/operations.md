@@ -56,8 +56,20 @@ The owner prefix should be the pod UID. The process appends its own UUID, and th
 
 Coordinator failures, including a late-inbox rejection, leave the batch unacknowledged. The loader will not skip the archiver and write those points straight to Influx.
 
+### Temporary backup maintenance
+
+When the archiver is capturing a state backup, new write admission can return 503 with `Retry-After`. This loader treats that as a short maintenance pause, not a misconfiguration:
+
+1. The current batch stays unacknowledged.
+2. If a permit was acquired but no hot Influx write has started, that unused permit is released before exit.
+3. The process closes RabbitMQ, sleeps for the `Retry-After` delay, and exits with status 1 so the workload restarts and retries.
+
+Healthy renewals for writers already admitted continue during capture. Operators should expect brief reconnect/restart noise around the archiver's backup window; they should not see acknowledged gaps from the pause itself. Details are in the [backup and recovery procedure](https://github.com/waggle-sensor/beehive-hot-to-cold-loader/blob/main/docs/backup-recovery.md).
+
 Staged rollout, deletion controls, and late corrections belong to the archiver. See the [hot-to-cold loader guide](https://github.com/waggle-sensor/beehive-hot-to-cold-loader/blob/main/README.md) and the [design record](https://github.com/seanshahkarami/sage-data-rework/blob/main/plans/12_dynamic_archival_service.md).
 
 ## What a failure looks like
 
 A failed flush is an exception from the consumer, not an acknowledged gap. The broker still holds the deliveries. Another attempt in the same process reuses the flush's idempotency key. Restarting the process consumes the deliveries again and creates a new key, so a repeated hot write is possible and a late receipt is a new archiver request.
+
+An `AdmissionPaused` exit after coordinator backup is the intentional restart path above. It is not the same as a permanent coordination or Influx failure.

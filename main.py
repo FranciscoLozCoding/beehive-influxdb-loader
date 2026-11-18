@@ -10,12 +10,13 @@ import argparse
 import base64
 import json
 import uuid
-from archive import ArchiveClient, day_for_ns
+from archive import ArchiveClient, day_for_ns, AdmissionPaused
 import pika
 from influxdb_client import InfluxDBClient
 from influxdb_client.client.write_api import SYNCHRONOUS, WritePrecision
 from os import getenv
 import logging
+import time
 import math
 import ssl
 import wagglemsg as message
@@ -164,7 +165,11 @@ class MessageHandler:
                 late = [r for r in records if day_for_ns(r["time"]) not in lease.hot_days]
                 if late:
                     lease.check()
-                    self.archive.enqueue(self.attempt, late)
+                    try:
+                        self.archive.enqueue(self.attempt, late)
+                    except AdmissionPaused:
+                        lease.abort_before_hot_write()
+                        raise
             else:
                 hot = records
             if hot:
@@ -367,4 +372,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except AdmissionPaused as error:
+        # ExitStack has closed RabbitMQ first, allowing unacknowledged deliveries
+        # to be redelivered. Do not sleep with an active BlockingConnection.
+        logging.warning("%s; retry after %.0fs", error, error.retry_after)
+        time.sleep(error.retry_after)
+        raise SystemExit(1)

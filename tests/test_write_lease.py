@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 import time
 
-from archive import ArchiveClient, WriteLease, WriteLeaseLost
+from archive import ArchiveClient, WriteLease, WriteLeaseLost, AdmissionPaused
 
 
 def grant(seconds=1800, days=None):
@@ -42,6 +42,13 @@ class TestWriteLease(TestCase):
             lease.finish()
         client.release.assert_not_called()
 
+    def test_backup_abort_releases_unused_permit(self):
+        client = self.client()
+        with WriteLease(client, "batch", grant()) as lease:
+            lease.abort_before_hot_write()
+        client.release.assert_called_once_with("batch")
+        self.assertFalse(lease._thread.is_alive())
+
     def test_failed_batch_stops_without_release(self):
         client = self.client()
         with self.assertRaisesRegex(RuntimeError, "write failed"):
@@ -73,6 +80,13 @@ class TestWriteLease(TestCase):
         self.assertEqual(client.renew.call_count, 2)
         with self.assertRaises(WriteLeaseLost):
             lease.check()
+
+    def test_backup_503_becomes_retryable_admission_pause(self):
+        client = ArchiveClient("http://coordinator", "token", "waggle", "pod")
+        with patch("archive.urlopen", side_effect=HTTPError("http://coordinator", 503, "paused", {"Retry-After":"30"}, None)):
+            with self.assertRaises(AdmissionPaused) as raised:
+                client.acquire_lease("batch", ["2025-03-01"])
+        self.assertEqual(raised.exception.retry_after, 30)
 
     def test_protocol_includes_owner(self):
         client = ArchiveClient("http://coordinator", "token", "waggle", "pod")

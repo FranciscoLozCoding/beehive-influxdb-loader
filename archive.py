@@ -47,6 +47,13 @@ def cold_record(record):
                 tags={k: v for k, v in record["tags"].items() if v != ""}, kind=kind, value=text)
 
 
+class AdmissionPaused(RuntimeError):
+    """Retry the unacknowledged batch after temporary backup maintenance."""
+    def __init__(self, retry_after=30):
+        super().__init__("hot-to-cold write admission paused for backup")
+        self.retry_after = max(1, min(float(retry_after), 60))
+
+
 class ArchiveClient:
     """Post loader-role requests. The wire owner is the configured prefix plus a process UUID.
 
@@ -66,8 +73,17 @@ class ArchiveClient:
         payload["bucket"] = self.bucket
         request = Request(self.url + path, json.dumps(payload, allow_nan=False).encode(),
                           {"Content-Type": "application/json", "Authorization": "Bearer " + self.token})
-        with urlopen(request, timeout=self.timeout) as response:
-            return json.load(response)
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                return json.load(response)
+        except HTTPError as error:
+            if error.code == 503 and error.headers.get("Retry-After"):
+                try:
+                    delay = float(error.headers["Retry-After"])
+                except (ValueError, TypeError):
+                    delay = 30
+                raise AdmissionPaused(delay) from error
+            raise
 
     def acquire_lease(self, request_id, days):
         """Ask which of these UTC days are still hot. The caller must release the lease."""
@@ -186,6 +202,16 @@ class WriteLease:
         """Stop renewal, confirm the deadline, and release the permit."""
         self._halt()
         self.check()
+        self.client.release(self.id)
+        self._finished = True
+
+    def abort_before_hot_write(self):
+        """Release only when the caller proves it never attempted an Influx write.
+
+        The batch remains unacknowledged, including any accepted late records;
+        broker redelivery will route it again under fresh admission.
+        """
+        self._halt()
         self.client.release(self.id)
         self._finished = True
 

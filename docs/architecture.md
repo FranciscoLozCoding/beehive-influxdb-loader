@@ -60,4 +60,12 @@ Writer permits have renewable deadlines. Acquire returns the admitted days and `
 
 A failed/partial write, lost lease, or failed release leaves the batch unacknowledged and stops renewal. Consumption exits; broker redelivery obtains new admission, routing fenced days through the late inbox. The coordinator stops waiting after the last confirmed expiry plus one minute of drain grace. Expired/released permits cannot renew. Initial/renewed duration is configured on the coordinator using `--write-lease-duration` (default 30 minutes).
 
+### Coordinator backup admission pause
+
+While the hot-to-cold loader captures an online state backup, it temporarily closes new write grants and late/quarantine submissions. Those routes return **HTTP 503** with **`Retry-After`** (typically 30 seconds). Existing writer renewals and releases stay available; read grants are unaffected.
+
+This client's coordination HTTP maps that response to `AdmissionPaused`. The process leaves the batch unacknowledged, closes the broker connection, sleeps for the requested delay (clamped to 1–60 seconds), and exits so the deployment restarts and retries. It does not treat the pause as a permanent coordinator failure or write the batch straight to Influx.
+
+If the pause arrives **after** a permit was acquired but **before any hot Influx write was attempted** (for example on late-inbox enqueue), the loader calls `abort_before_hot_write`: it stops renewal and releases that unused permit, then still leaves the deliveries unacknowledged for broker replay. A failed or uncertain Influx write never releases a permit as successful just to clear the backup barrier.
+
 A lease cannot cancel a request already executing in Influx. The synchronous write uses the configured finite client timeout; an expired in-flight write may still finish at the server. Recovery depends on durable unacknowledged broker messages being redelivered. Deploy renewal-aware writers with the coordinator and drain older writers before resuming archival. See the [hot-to-cold loader guide](https://github.com/waggle-sensor/beehive-hot-to-cold-loader/blob/main/docs/operations.md).

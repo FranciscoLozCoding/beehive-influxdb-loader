@@ -27,6 +27,8 @@ The tests mock RabbitMQ and Influx. They check the flush order and the cases tha
 - Lease loss after an in-flight write or a failed release leaves the batch unacknowledged.
 - Renewals retain admission, retry transient errors, and reject late responses or expired grants.
 - With coordination disabled, a write error still stays unacknowledged.
+- A coordinator 503 with `Retry-After` becomes `AdmissionPaused`.
+- When that pause arrives before any hot write, the unused permit is released (`abort_before_hot_write`) and the batch stays unacknowledged.
 
 Day routing keeps the original nanosecond timestamp, places the instant before UTC midnight on the previous day, and drops empty tags. The validator tests check types, length limits, and integer-to-float coercion.
 
@@ -38,7 +40,7 @@ These tests do not start RabbitMQ, InfluxDB, or the archiver. A live broker and 
 | --- | --- |
 | `main.py` | Process entrypoint and `MessageHandler` |
 | `archive.py` | Archiver client and late-record encoding |
-| `tests/test_archival.py` | Flush, acknowledgement, quarantine, and day routing |
-| `tests/test_write_lease.py` | Renewal, expiry, failure, and thread cleanup |
+| `tests/test_archival.py` | Flush, acknowledgement, quarantine, day routing, and backup admission pause |
+| `tests/test_write_lease.py` | Renewal, expiry, failure, unused-permit abort, and 503→`AdmissionPaused` |
 | `tests/test_validators.py` | Type, length, and value coercion |
 | `testing/` | Local RabbitMQ and InfluxDB compose stack |
