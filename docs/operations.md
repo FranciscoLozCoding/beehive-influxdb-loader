@@ -21,7 +21,7 @@ Leave `HOT_TO_COLD_LOADER_URL` unset for a direct Influx writer. Set it, the loa
 
 ## Dry-run
 
-`--dry-run` / `DRY_RUN=true` consumes a **mirror** queue, validates batches, acks that queue, and logs `would_write` / `would_quarantine` counts. It does not write Influx, call the archiver, or publish `influx-messages-quarantine`. The production queue `influx-messages` is refused at startup.
+`--dry-run` / `DRY_RUN=true` consumes a **mirror** queue, validates batches, and acks that queue. With `HOT_TO_COLD_LOADER_URL` set it acquires a write lease so `would_write` / `would_late` match real hot vs late admission, then releases that unused permit (`abort_before_hot_write`). It does not write Influx, post `/v1/late`, or quarantine. Without the URL, every valid record counts as `would_write`. The production queue `influx-messages` is refused at startup.
 
 Publishers still send once to `waggle.msg`. Bind a second durable queue (`influx-messages-canary`) with `#` so the canary gets a copy. Honeyhouse: apply `beehive-rabbitmq/canary` then `beehive-influxdb-loader/canary`. See those READMEs for enable/teardown. Do not point `--dry-run` at `influx-messages`.
 
@@ -45,7 +45,7 @@ The process serves Prometheus text on `METRICS_PORT`.
 | `influxdbloader_messages_processed_bytes` | none | Body bytes of those deliveries |
 | `influxdbloader_messages_processed_total_by_node_total` | `node`, `vsn` | Valid measurements written or accepted for late ingestion |
 | `influxdbloader_messages_processed_bytes_by_node` | `node`, `vsn` | Body bytes of those valid measurements |
-| `influxdbloader_dry_run` | none | `1` when this process is skipping Influx, archiver, and quarantine IO |
+| `influxdbloader_dry_run` | none | `1` when this process is skipping Influx, late-inbox, and quarantine writes |
 
 A failed flush does not increment these counters. Invalid deliveries count in the unlabeled totals once quarantine succeeds, and they are absent from the node metrics.
 

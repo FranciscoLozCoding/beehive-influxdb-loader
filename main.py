@@ -47,7 +47,7 @@ messages_processed_bytes_by_node = Counter(
 )
 dry_run_mode = Gauge(
     "influxdbloader_dry_run",
-    "1 when this process skips Influx, archiver, and quarantine side effects.",
+    "1 when this process skips Influx, late-inbox, and quarantine writes.",
 )
 
 
@@ -136,8 +136,9 @@ class MessageHandler:
         writes only days the archiver still calls hot. Other days go to the
         late inbox. A coordinator or write failure does not fall back to a
         direct Influx write, and it does not acknowledge the batch. Dry-run
-        validates and acks the configured queue only; it does not write Influx,
-        call the archiver, or publish quarantine.
+        still acquires a write lease so hot vs late is real, then releases
+        that unused permit. It does not write Influx, post the late inbox,
+        or quarantine.
         """
         if not self.batch:
             return
@@ -175,30 +176,34 @@ class MessageHandler:
                     finally:
                         pub.close()
 
-        if self.dry_run:
-            invalid = len(self.batch) - len(records)
-            logging.info(
-                "dry-run flush deliveries=%d would_write=%d would_late=0 would_quarantine=%d",
-                len(self.batch), len(records), invalid,
-            )
-            self._ack_batch(records, bytes_by_node)
-            return
-
+        invalid = len(self.batch) - len(records)
         context = (self.archive.acquire_lease(self.attempt, [day_for_ns(r["time"]) for r in records])
                    if self.archive and records else nullcontext())
         with context as lease:
             if lease is not None:
                 hot = [r for r in records if day_for_ns(r["time"]) in lease.hot_days]
                 late = [r for r in records if day_for_ns(r["time"]) not in lease.hot_days]
-                if late:
-                    lease.check()
-                    try:
-                        self.archive.enqueue(self.attempt, late)
-                    except AdmissionPaused:
-                        lease.abort_before_hot_write()
-                        raise
             else:
                 hot = records
+                late = []
+            if self.dry_run:
+                logging.info(
+                    "dry-run flush deliveries=%d would_write=%d would_late=%d would_quarantine=%d",
+                    len(self.batch), len(hot), len(late), invalid,
+                )
+                if lease is not None:
+                    # Never claimed a write; drop the permit so it does not
+                    # hold a hot day for the real loaders.
+                    lease.abort_before_hot_write()
+                self._ack_batch(records, bytes_by_node)
+                return
+            if late:
+                lease.check()
+                try:
+                    self.archive.enqueue(self.attempt, late)
+                except AdmissionPaused:
+                    lease.abort_before_hot_write()
+                    raise
             if hot:
                 if lease is not None:
                     lease.check()
@@ -340,7 +345,7 @@ def main():
         "--dry-run",
         action="store_true",
         default=env_flag("DRY_RUN"),
-        help="validate and ack a non-production queue; skip Influx, archiver, and quarantine IO",
+        help="validate and ack a non-production queue; acquire write leases for routing but skip Influx, late inbox, and quarantine writes",
     )
     args = parser.parse_args()
     if args.dry_run and args.rabbitmq_queue == "influx-messages":
@@ -377,9 +382,11 @@ def main():
     with ExitStack() as es:
         client = None
         if args.dry_run:
-            logging.info("dry-run enabled; skipping Influx and archiver clients")
+            logging.info("dry-run enabled; skipping Influx, late inbox, and quarantine writes")
             if args.hot_to_cold_loader_url:
-                logging.info("dry-run stubs coordination even though HOT_TO_COLD_LOADER_URL is set")
+                logging.info("dry-run will acquire write leases at %s", args.hot_to_cold_loader_url)
+            else:
+                logging.info("dry-run has no HOT_TO_COLD_LOADER_URL; valid records count as would_write")
         else:
             logging.info("connecting to influxdb at %s", args.influxdb_url)
             client = es.enter_context(
@@ -409,10 +416,9 @@ def main():
             influxdb_org=args.influxdb_org,
             max_flush_interval=args.max_flush_interval,
             max_batch_size=args.max_batch_size,
-            archive_client=(None if args.dry_run else
-                            (ArchiveClient(args.hot_to_cold_loader_url, args.hot_to_cold_loader_token,
+            archive_client=(ArchiveClient(args.hot_to_cold_loader_url, args.hot_to_cold_loader_token,
                                           args.influxdb_bucket, args.hot_to_cold_loader_owner)
-                             if args.hot_to_cold_loader_url else None)),
+                             if args.hot_to_cold_loader_url else None),
             dry_run=args.dry_run,
         )
         ch.basic_consume(args.rabbitmq_queue, handler.handle)

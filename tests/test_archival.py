@@ -127,16 +127,55 @@ class TestArchival(TestCase):
         invalid = self.delivery(handler, 0, 2)
         pub = Mock()
         handler.rabbitmq_conn.channel.return_value = pub
+        lease = coord.acquire_lease.return_value
         with patch("main.message.load", side_effect=[self.parse(b"1746057600000000194"), ValueError("bad payload")]):
             handler.flush()
         writer.write.assert_not_called()
-        coord.acquire_lease.assert_not_called()
+        coord.acquire_lease.assert_called_once()
+        lease.abort_before_hot_write.assert_called_once_with()
         coord.enqueue.assert_not_called()
         coord.quarantine.assert_not_called()
+        coord.release.assert_not_called()
         handler.rabbitmq_conn.channel.assert_not_called()
         valid.basic_ack.assert_called_once_with(1)
         invalid.basic_ack.assert_called_once_with(2)
         self.assertEqual(handler.batch, [])
+
+    def test_dry_run_classifies_hot_and_late_without_storage_io(self):
+        handler, writer, coord = self.make_handler(archive=True, dry_run=True)
+        hot = self.delivery(handler, 1746057600000000194, 1)
+        late = self.delivery(handler, 1740787200000000194, 2)
+        lease = coord.acquire_lease.return_value
+        with patch("main.message.load", side_effect=self.parse), self.assertLogs("root", level="INFO") as logs:
+            handler.flush()
+        self.assertTrue(any("would_write=1 would_late=1 would_quarantine=0" in line for line in logs.output))
+        writer.write.assert_not_called()
+        coord.enqueue.assert_not_called()
+        coord.quarantine.assert_not_called()
+        lease.finish.assert_not_called()
+        lease.abort_before_hot_write.assert_called_once_with()
+        hot.basic_ack.assert_called_once_with(1)
+        late.basic_ack.assert_called_once_with(2)
+
+    def test_dry_run_without_archiver_counts_valid_as_would_write(self):
+        handler, writer, _ = self.make_handler(archive=False, dry_run=True)
+        channel = self.delivery(handler, 1746057600000000194, 1)
+        with patch("main.message.load", side_effect=self.parse), self.assertLogs("root", level="INFO") as logs:
+            handler.flush()
+        self.assertTrue(any("would_write=1 would_late=0" in line for line in logs.output))
+        writer.write.assert_not_called()
+        channel.basic_ack.assert_called_once_with(1)
+
+    def test_dry_run_admission_pause_releases_unused_permit_without_ack(self):
+        handler, writer, coord = self.make_handler(archive=True, dry_run=True)
+        channel = self.delivery(handler, 1746057600000000194, 1)
+        coord.acquire_lease.side_effect = AdmissionPaused(30)
+        with patch("main.message.load", side_effect=self.parse), self.assertRaises(AdmissionPaused):
+            handler.flush()
+        writer.write.assert_not_called()
+        coord.enqueue.assert_not_called()
+        channel.basic_ack.assert_not_called()
+        self.assertEqual(len(handler.batch), 1)
 
     def test_env_flag_truthy_strings(self):
         with patch("main.getenv", return_value="true"):

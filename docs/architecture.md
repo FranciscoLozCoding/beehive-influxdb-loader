@@ -52,7 +52,7 @@ Invalid deliveries are removed from the write set and quarantined. They are stil
 
 An empty `HOT_TO_COLD_LOADER_URL` disables coordination. Every valid record is written to Influx, and invalid originals go to the durable `influx-messages-quarantine` queue with publisher confirms.
 
-A set URL requires the loader token and owner. The client appends a process UUID to the owner prefix. Before writing, the loader asks the archiver which of the batch's UTC days are still hot. Days the archiver returns are written to Influx. Any other day is encoded and posted to the late inbox, with the original nanosecond timestamp. Empty tag values are omitted from that encoding. The permit is released only after the hot write and the late receipt succeed. A coordinator error does not fall back to a direct Influx write.
+A set URL requires the loader token and owner. The client appends a process UUID to the owner prefix. Before writing, the loader asks the archiver which of the batch's UTC days are still hot. Days the archiver returns are written to Influx. Any other day is encoded and posted to the late inbox, with the original nanosecond timestamp. Empty tag values are omitted from that encoding. The permit is released only after the hot write and the late receipt succeed. A coordinator error does not fall back to a direct Influx write. Dry-run uses the same acquire and hot/late split, then releases the unused permit without Influx, late-inbox, or quarantine writes.
 
 The day of a timestamp is its UTC calendar day. The instant one nanosecond before midnight belongs to the previous day. The calculation uses integer seconds so a nanosecond value cannot round across that boundary.
 
