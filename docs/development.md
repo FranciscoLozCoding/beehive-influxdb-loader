@@ -27,6 +27,7 @@ The tests mock RabbitMQ and Influx. They check the flush order and the cases tha
 - Lease loss after an in-flight write or a failed release leaves the batch unacknowledged.
 - Renewals retain admission, retry transient errors, and reject late responses or expired grants.
 - With coordination disabled, a write error still stays unacknowledged.
+- Dry-run acks after validation and does not call Influx, the archiver, or quarantine.
 - A coordinator 503 with `Retry-After` becomes `AdmissionPaused`.
 - When that pause arrives before any hot write, the unused permit is released (`abort_before_hot_write`) and the batch stays unacknowledged.
 

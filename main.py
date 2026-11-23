@@ -21,7 +21,7 @@ import math
 import ssl
 import wagglemsg as message
 from contextlib import ExitStack, nullcontext
-from prometheus_client import start_http_server, Counter
+from prometheus_client import start_http_server, Counter, Gauge
 from collections import defaultdict
 
 # Counters move only after acknowledgement. Unlabeled totals include invalid
@@ -45,6 +45,18 @@ messages_processed_bytes_by_node = Counter(
     "Total message bytes processed by InfluxDB loader by VSN.",
     ["node", "vsn"],
 )
+dry_run_mode = Gauge(
+    "influxdbloader_dry_run",
+    "1 when this process skips Influx, archiver, and quarantine side effects.",
+)
+
+
+def env_flag(name):
+    """True when the named environment variable is a common truthy string."""
+    value = getenv(name)
+    if value is None:
+        return False
+    return value.strip().lower() in ("1", "true", "yes", "on")
 
 
 def assert_type(obj, t):
@@ -103,6 +115,7 @@ class MessageHandler:
         max_flush_interval: float,
         max_batch_size: int,
         archive_client=None,
+        dry_run=False,
     ):
         self.rabbitmq_conn = rabbitmq_conn
         self.influxdb_client = influxdb_client
@@ -113,6 +126,7 @@ class MessageHandler:
         self.batch = []
         self.archive = archive_client
         self.attempt = None
+        self.dry_run = dry_run
 
     def flush(self):
         """Validate, route, persist, then acknowledge every delivery in the batch.
@@ -121,7 +135,9 @@ class MessageHandler:
         acknowledged with the rest once quarantine succeeds. Coordinated mode
         writes only days the archiver still calls hot. Other days go to the
         late inbox. A coordinator or write failure does not fall back to a
-        direct Influx write, and it does not acknowledge the batch.
+        direct Influx write, and it does not acknowledge the batch. Dry-run
+        validates and acks the configured queue only; it does not write Influx,
+        call the archiver, or publish quarantine.
         """
         if not self.batch:
             return
@@ -141,6 +157,8 @@ class MessageHandler:
                                     fields={"value": coerce_value(msg.value)}, time=msg.timestamp))
                 bytes_by_node[(msg.meta.get("node", ""), msg.meta.get("vsn", ""))] += len(body)
             except Exception as error:
+                if self.dry_run:
+                    continue
                 # Retain invalid originals durably; do not acknowledge a log line.
                 payload = json.dumps(dict(body=base64.b64encode(body).decode(),
                                           user_id=properties.user_id, reason=str(error)))
@@ -156,6 +174,15 @@ class MessageHandler:
                                           properties=pika.BasicProperties(delivery_mode=2), mandatory=True)
                     finally:
                         pub.close()
+
+        if self.dry_run:
+            invalid = len(self.batch) - len(records)
+            logging.info(
+                "dry-run flush deliveries=%d would_write=%d would_late=0 would_quarantine=%d",
+                len(self.batch), len(records), invalid,
+            )
+            self._ack_batch(records, bytes_by_node)
+            return
 
         context = (self.archive.acquire_lease(self.attempt, [day_for_ns(r["time"]) for r in records])
                    if self.archive and records else nullcontext())
@@ -183,6 +210,10 @@ class MessageHandler:
             if lease is not None:
                 lease.check()
                 lease.finish()
+        self._ack_batch(records, bytes_by_node)
+
+    def _ack_batch(self, records, bytes_by_node):
+        """Acknowledge the current batch and bump processed counters."""
         for ch, method, properties, body in self.batch:
             ch.basic_ack(method.delivery_tag)
         messages_processed_total.inc(len(self.batch))
@@ -305,7 +336,15 @@ def main():
     parser.add_argument("--hot-to-cold-loader.url", dest="hot_to_cold_loader_url", default=getenv("HOT_TO_COLD_LOADER_URL", ""))
     parser.add_argument("--hot-to-cold-loader.loader-token", dest="hot_to_cold_loader_token", default=getenv("HOT_TO_COLD_LOADER_LOADER_TOKEN", ""))
     parser.add_argument("--hot-to-cold-loader.loader-owner", dest="hot_to_cold_loader_owner", default=getenv("HOT_TO_COLD_LOADER_LOADER_OWNER", ""))
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=env_flag("DRY_RUN"),
+        help="validate and ack a non-production queue; skip Influx, archiver, and quarantine IO",
+    )
     args = parser.parse_args()
+    if args.dry_run and args.rabbitmq_queue == "influx-messages":
+        parser.error("dry-run refuses the production queue influx-messages; consume a mirror queue")
     if args.hot_to_cold_loader_url and (not args.hot_to_cold_loader_token or not args.hot_to_cold_loader_owner):
         parser.error("hot-to-cold-loader.url requires hot-to-cold-loader.loader-token and a unique hot-to-cold-loader.loader-owner (pod UID)")
 
@@ -333,19 +372,26 @@ def main():
     )
 
     start_http_server(args.metrics_port)
+    dry_run_mode.set(1 if args.dry_run else 0)
 
     with ExitStack() as es:
-        logging.info("connecting to influxdb at %s", args.influxdb_url)
-        client = es.enter_context(
-            InfluxDBClient(
-                url=args.influxdb_url,
-                token=args.influxdb_token,
-                org=args.influxdb_org,
-                timeout=args.influxdb_connection_timeout,
-                enable_gzip=True,
+        client = None
+        if args.dry_run:
+            logging.info("dry-run enabled; skipping Influx and archiver clients")
+            if args.hot_to_cold_loader_url:
+                logging.info("dry-run stubs coordination even though HOT_TO_COLD_LOADER_URL is set")
+        else:
+            logging.info("connecting to influxdb at %s", args.influxdb_url)
+            client = es.enter_context(
+                InfluxDBClient(
+                    url=args.influxdb_url,
+                    token=args.influxdb_token,
+                    org=args.influxdb_org,
+                    timeout=args.influxdb_connection_timeout,
+                    enable_gzip=True,
+                )
             )
-        )
-        logging.info("connected to influxdb")
+            logging.info("connected to influxdb")
 
         logging.info("connecting to rabbitmq")
         conn = es.enter_context(pika.BlockingConnection(params))
@@ -363,9 +409,11 @@ def main():
             influxdb_org=args.influxdb_org,
             max_flush_interval=args.max_flush_interval,
             max_batch_size=args.max_batch_size,
-            archive_client=(ArchiveClient(args.hot_to_cold_loader_url, args.hot_to_cold_loader_token,
+            archive_client=(None if args.dry_run else
+                            (ArchiveClient(args.hot_to_cold_loader_url, args.hot_to_cold_loader_token,
                                           args.influxdb_bucket, args.hot_to_cold_loader_owner)
-                            if args.hot_to_cold_loader_url else None),
+                             if args.hot_to_cold_loader_url else None)),
+            dry_run=args.dry_run,
         )
         ch.basic_consume(args.rabbitmq_queue, handler.handle)
         ch.start_consuming()

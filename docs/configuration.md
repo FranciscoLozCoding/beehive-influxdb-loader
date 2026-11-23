@@ -19,6 +19,7 @@ Each flag takes its default from the environment variable in the table. When the
 | `--rabbitmq_queue` | `RABBITMQ_QUEUE` | `influx-messages` | Durable queue this process consumes |
 | `--ssl_no_verify` | none | off | With a CA bundle, skip certificate verification. Intended for debugging |
 | `--prefetch_count` | `PREFETCH_COUNT` | `10000` | Maximum unacknowledged deliveries the broker may send |
+| `--dry-run` | `DRY_RUN` | off | Validate and ack only. Skips Influx writes, archiver HTTP, and quarantine publish. Startup fails when the consume queue is `influx-messages` |
 
 TLS hostname checking is disabled whenever a CA bundle is configured. The connection uses a 10 second socket timeout and a 60 second retry delay. Pika's own log output is suppressed; pass `--debug` for this process's debug log.
 

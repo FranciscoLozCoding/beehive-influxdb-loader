@@ -19,6 +19,12 @@ python main.py
 
 Leave `HOT_TO_COLD_LOADER_URL` unset for a direct Influx writer. Set it, the loader token, and a unique owner together when this process must participate in archival. The three settings are in [configuration](configuration.md#archival-coordination).
 
+## Dry-run
+
+`--dry-run` / `DRY_RUN=true` consumes a **mirror** queue, validates batches, acks that queue, and logs `would_write` / `would_quarantine` counts. It does not write Influx, call the archiver, or publish `influx-messages-quarantine`. The production queue `influx-messages` is refused at startup.
+
+Publishers still send once to `waggle.msg`. Bind a second durable queue (`influx-messages-canary`) with `#` so the canary gets a copy. Honeyhouse: apply `beehive-rabbitmq/canary` then `beehive-influxdb-loader/canary`. See those READMEs for enable/teardown. Do not point `--dry-run` at `influx-messages`.
+
 ## Local broker and InfluxDB
 
 `testing/docker-compose.yml` starts InfluxDB 2.1, RabbitMQ, and this loader. It does not set an archiver URL, so the composed loader writes only to Influx. The published token in that file is a local fixture. Do not reuse it anywhere else.
@@ -39,6 +45,7 @@ The process serves Prometheus text on `METRICS_PORT`.
 | `influxdbloader_messages_processed_bytes` | none | Body bytes of those deliveries |
 | `influxdbloader_messages_processed_total_by_node_total` | `node`, `vsn` | Valid measurements written or accepted for late ingestion |
 | `influxdbloader_messages_processed_bytes_by_node` | `node`, `vsn` | Body bytes of those valid measurements |
+| `influxdbloader_dry_run` | none | `1` when this process is skipping Influx, archiver, and quarantine IO |
 
 A failed flush does not increment these counters. Invalid deliveries count in the unlabeled totals once quarantine succeeds, and they are absent from the node metrics.
 

@@ -7,11 +7,11 @@ from unittest import TestCase, main
 from unittest.mock import Mock, patch
 
 from archive import cold_record, day_for_ns, WriteLeaseLost, AdmissionPaused
-from main import MessageHandler
+from main import MessageHandler, env_flag
 
 
 class TestArchival(TestCase):
-    def make_handler(self, archive=True):
+    def make_handler(self, archive=True, dry_run=False):
         conn, influx = Mock(), Mock()
         influx.write_api.return_value.__enter__ = Mock(return_value=influx.write_api.return_value)
         influx.write_api.return_value.__exit__ = Mock(return_value=False)
@@ -23,7 +23,7 @@ class TestArchival(TestCase):
             lease.__exit__ = Mock(return_value=False)
             lease.finish.side_effect = lambda: coord.release("batch")
             coord.acquire_lease.return_value = lease
-        handler = MessageHandler(conn, influx, "waggle", "waggle", 1, 5000, coord)
+        handler = MessageHandler(conn, influx, "waggle", "waggle", 1, 5000, coord, dry_run=dry_run)
         return handler, influx.write_api.return_value, coord
 
     def delivery(self, handler, stamp, tag):
@@ -120,6 +120,31 @@ class TestArchival(TestCase):
         with patch("main.message.load", side_effect=ValueError("bad payload")), self.assertRaises(RuntimeError):
             handler.flush()
         channel.basic_ack.assert_not_called()
+
+    def test_dry_run_acks_without_influx_archive_or_quarantine(self):
+        handler, writer, coord = self.make_handler(archive=True, dry_run=True)
+        valid = self.delivery(handler, 1746057600000000194, 1)
+        invalid = self.delivery(handler, 0, 2)
+        pub = Mock()
+        handler.rabbitmq_conn.channel.return_value = pub
+        with patch("main.message.load", side_effect=[self.parse(b"1746057600000000194"), ValueError("bad payload")]):
+            handler.flush()
+        writer.write.assert_not_called()
+        coord.acquire_lease.assert_not_called()
+        coord.enqueue.assert_not_called()
+        coord.quarantine.assert_not_called()
+        handler.rabbitmq_conn.channel.assert_not_called()
+        valid.basic_ack.assert_called_once_with(1)
+        invalid.basic_ack.assert_called_once_with(2)
+        self.assertEqual(handler.batch, [])
+
+    def test_env_flag_truthy_strings(self):
+        with patch("main.getenv", return_value="true"):
+            self.assertTrue(env_flag("DRY_RUN"))
+        with patch("main.getenv", return_value="0"):
+            self.assertFalse(env_flag("DRY_RUN"))
+        with patch("main.getenv", return_value=None):
+            self.assertFalse(env_flag("DRY_RUN"))
 
     def test_unmanaged_write_error_is_not_acknowledged(self):
         handler, writer, _ = self.make_handler(archive=False)
