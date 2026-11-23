@@ -23,6 +23,14 @@ Leave `HOT_TO_COLD_LOADER_URL` unset for a direct Influx writer. Set it, the loa
 
 `--dry-run` / `DRY_RUN=true` consumes a **mirror** queue, validates batches, and acks that queue. With `HOT_TO_COLD_LOADER_URL` set it acquires a write lease so `would_write` / `would_late` match real hot vs late admission, then releases that unused permit (`abort_before_hot_write`). It does not write Influx, post `/v1/late`, or quarantine. Without the URL, every valid record counts as `would_write`. The production queue `influx-messages` is refused at startup.
 
+Each flush logs `deliveries = would_write + would_late + would_quarantine`.
+
+| Count | Meaning | Live destination |
+| --- | --- | --- |
+| `would_write` | Valid, and the write lease listed that UTC day in `hot_days` | Influx |
+| `would_late` | Valid, but that day was not in `hot_days` (fenced or before the frontier) | Archiver `/v1/late` then will be sent to cold storage |
+| `would_quarantine` | Failed validation (bad payload, missing `node`, `user_id` ≠ `node-<node>`, and similar) | Archiver `/v1/quarantine`, or `influx-messages-quarantine` when uncoordinated |
+
 Publishers still send once to `waggle.msg`. Bind a second durable queue (`influx-messages-canary`) with `#` so the canary gets a copy. Honeyhouse: apply `beehive-rabbitmq/canary` then `beehive-influxdb-loader/canary`. See those READMEs for enable/teardown. Do not point `--dry-run` at `influx-messages`.
 
 ## Local broker and InfluxDB
